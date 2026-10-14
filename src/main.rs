@@ -816,6 +816,8 @@ async fn dispatch(cmd: Cmd, api: &str) -> Result<()> {
 async fn shell(api: &str) -> Result<()> {
     println!("g24 shell — type `help` for commands, `exit` to quit.");
     let mut rl = rustyline::DefaultEditor::new()?;
+    let hist = config_dir().map(|d| d.join("history")).unwrap_or_else(|_| PathBuf::from(".g24-history"));
+    let _ = rl.load_history(&hist);
     loop {
         let line = match rl.readline("g24> ") {
             Ok(l) => l,
@@ -849,6 +851,7 @@ async fn shell(api: &str) -> Result<()> {
             println!("error: {:#}", e);
         }
     }
+    let _ = rl.save_history(&hist);
     Ok(())
 }
 
