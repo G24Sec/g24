@@ -16,6 +16,9 @@ mod out {
     pub fn ok(msg: &str) {
         println!("{} {}", "✓".green().bold(), msg);
     }
+    // Reserved for verbose/diagnostic output; kept so the vocabulary stays
+    // in one place instead of ad-hoc println! calls.
+    #[allow(dead_code)]
     pub fn info(msg: &str) {
         println!("{} {}", "»".cyan().bold(), msg);
     }
@@ -25,6 +28,7 @@ mod out {
     pub fn err(msg: &str) {
         eprintln!("{} {}", "✗".red().bold(), msg);
     }
+    #[allow(dead_code)]
     pub fn header(msg: &str) {
         println!("\n{}", msg.cyan().bold());
     }
@@ -334,7 +338,7 @@ async fn cmd_list(api: &str, category: Option<String>, limit: usize, event: Opti
             "{}{:>6}  {:>4}pts  {:<9} {}",
             if solved { "*" } else { " " },
             ch["id"].as_u64().unwrap_or(0),
-            ch["points"].as_u64().unwrap_or(0),
+            live_points(&ch),
             ch["difficulty"].as_str().unwrap_or("?"),
             ch["title"].as_str().unwrap_or("?"),
         );
@@ -475,6 +479,20 @@ async fn fetch_challenge(api: &str, id: u64) -> Result<serde_json::Value> {
     }
 }
 
+/// Live award if the server computed decay, else the base points.
+fn live_points(ch: &serde_json::Value) -> u64 {
+    ch.get("value")
+        .and_then(|v| v.as_u64())
+        .or_else(|| ch["points"].as_u64())
+        .unwrap_or(0)
+}
+
+fn u64_either(ch: &serde_json::Value, camel: &str, snake: &str) -> Option<u64> {
+    ch.get(camel)
+        .and_then(|v| v.as_u64())
+        .or_else(|| ch.get(snake).and_then(|v| v.as_u64()))
+}
+
 async fn cmd_show(api: &str, id: u64) -> Result<()> {
     let ch = fetch_challenge(api, id).await?;
     println!("{}  [{}]", ch["title"].as_str().unwrap_or("?"), ch["id"].as_u64().unwrap_or(id));
@@ -482,27 +500,27 @@ async fn cmd_show(api: &str, id: u64) -> Result<()> {
         "{} · {} · {}pts",
         ch["category"].as_str().unwrap_or("?"),
         ch["difficulty"].as_str().unwrap_or("?"),
-        ch["points"].as_u64().unwrap_or(0),
+        live_points(&ch),
     );
-    if let Some(dp) = ch.get("initialPoints").and_then(|v| v.as_u64()) {
+    if let Some(dp) = u64_either(&ch, "initialPoints", "initial_points") {
         println!(
             "scoring: dynamic {} -> {} (decay limit {})",
             dp,
-            ch["minPoints"].as_u64().unwrap_or(10),
-            ch["decayLimit"].as_u64().unwrap_or(50),
+            u64_either(&ch, "minPoints", "min_points").unwrap_or(10),
+            u64_either(&ch, "decayLimit", "decay_limit").unwrap_or(50),
         );
     }
-    if let Some(reqs) = ch.get("unlockRequirements").and_then(|v| v.as_array()) {
-        if !reqs.is_empty() {
+    if let Some(reqs) = ch.get("unlockRequirements").and_then(|v| v.as_array())
+        && !reqs.is_empty() {
             println!("unlocks after: {}", reqs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
         }
-    }
     println!();
     println!("{}", ch["description"].as_str().unwrap_or(""));
     if let Some(files) = ch["files"].as_array() {
         println!("\nartifacts:");
         for f in files {
-            println!("  #{}  {} ({} bytes)", f["id"].as_u64().unwrap_or(0), f["name"].as_str().unwrap_or("?"), f["size_bytes"].as_u64().unwrap_or(0));
+            let size = f["sizeBytes"].as_u64().or_else(|| f["size_bytes"].as_u64()).unwrap_or(0);
+            println!("  #{}  {} ({} bytes)", f["id"].as_u64().unwrap_or(0), f["name"].as_str().unwrap_or("?"), size);
         }
     }
     Ok(())
@@ -549,11 +567,10 @@ async fn cmd_submit(api: &str, id: u64, flag: String) -> Result<()> {
         .await?;
     if v["success"].as_bool().unwrap_or(false) {
         out::ok(&format!("correct! +{} points", v["points"].as_u64().unwrap_or(0)));
-        if let Some(hp) = v["hintPenalty"].as_u64() {
-            if hp > 0 {
+        if let Some(hp) = v["hintPenalty"].as_u64()
+            && hp > 0 {
                 out::warn(&format!("hint penalty -{}, base {}", hp, v["basePoints"].as_u64().unwrap_or(0)));
             }
-        }
     } else {
         out::err(&format!("incorrect: {}", v["message"].as_str().unwrap_or("wrong flag")));
         if let Some(r) = v.get("rating") {
@@ -621,14 +638,35 @@ struct Manifest {
 fn load_manifest(path: &PathBuf) -> Result<(Manifest, PathBuf)> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let m: Manifest = toml::from_str(&text).context("parse manifest TOML")?;
-    if m.title.len() < 3 {
-        bail!("manifest: title too short");
-    }
+    validate_manifest(&m)?;
     let dir = path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     Ok((m, dir))
+}
+
+const DIFFICULTIES: &[&str] = &["beginner", "easy", "medium", "hard", "insane", "expert"];
+
+/// Fail fast with a local message instead of a server 400 roundtrip.
+/// Mirrors the creation guards in backend-next/lib/challenges.ts.
+fn validate_manifest(m: &Manifest) -> Result<()> {
+    if m.title.trim().len() < 3 {
+        bail!("manifest: title must be at least 3 characters");
+    }
+    if m.description.trim().len() < 10 {
+        bail!("manifest: description must be at least 10 characters");
+    }
+    if m.category.trim().len() < 2 {
+        bail!("manifest: category is required");
+    }
+    if !DIFFICULTIES.contains(&m.difficulty.to_lowercase().as_str()) {
+        bail!("manifest: difficulty must be one of: {}", DIFFICULTIES.join(", "));
+    }
+    if m.points < 10 || m.points > 1000 {
+        bail!("manifest: points must be between 10 and 1000");
+    }
+    Ok(())
 }
 
 fn manifest_form(
@@ -940,14 +978,11 @@ async fn cmd_event(api: &str, slug: String) -> Result<()> {
 async fn cmd_join(api: &str, slug: String, team: Option<String>) -> Result<()> {
     let token = read_token()?;
     let (c, base, _) = authed(api).await?;
-    let mut body = serde_json::json!({});
-    if let Some(t) = team {
-        body["team"] = serde_json::Value::String(t);
-    }
+    // Registration takes no team field; teams are created separately below.
     let v: serde_json::Value = c
         .post(format!("{base}/api/ctf-registrations/{slug}"))
-        .bearer_auth(token)
-        .json(&body)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({}))
         .send()
         .await?
         .json()
@@ -956,6 +991,26 @@ async fn cmd_join(api: &str, slug: String, team: Option<String>) -> Result<()> {
         bail!("{}", v["message"].as_str().unwrap_or("registration failed"));
     }
     println!("{}", v["message"].as_str().unwrap_or("registered"));
+    if let Some(name) = team {
+        let t: serde_json::Value = c
+            .post(format!("{base}/api/ctf-teams/{slug}"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if !t["success"].as_bool().unwrap_or(false) {
+            bail!(
+                "registered, but team creation failed: {}",
+                t["message"].as_str().unwrap_or("unknown error")
+            );
+        }
+        println!("team '{}' created", t["team"]["name"].as_str().unwrap_or(&name));
+        if let Some(code) = t["team"]["invite_code"].as_str().or_else(|| t["team"]["inviteCode"].as_str()) {
+            println!("invite code: {code} (expires in 24h)");
+        }
+    }
     Ok(())
 }
 
@@ -975,7 +1030,9 @@ async fn render_board(api: &str, event: &Option<String>, limit: usize) -> Result
     .json()
     .await?;
     use owo_colors::OwoColorize;
+    // The global board always returns its top 100; honor --limit client-side.
     let board = v["leaderboard"].as_array().cloned().unwrap_or_default();
+    let board: Vec<serde_json::Value> = board.into_iter().take(limit.max(1)).collect();
     for (i, e) in board.iter().enumerate() {
         let rank = e["rank"].as_u64().unwrap_or(i as u64 + 1);
         let name = e["username"]
@@ -1026,30 +1083,30 @@ fn split_args(line: &str) -> Vec<String> {
 
 async fn dispatch(cmd: Cmd, api: &str) -> Result<()> {
     match cmd {
-        Cmd::Login => cmd_login(&api).await?,
+        Cmd::Login => cmd_login(api).await?,
         Cmd::Logout => {
             fs::remove_file(token_path()?).ok();
             println!("signed out");
         }
-        Cmd::Me => cmd_me(&api).await?,
-        Cmd::Categories => cmd_categories(&api).await?,
-        Cmd::List { category, limit, event } => cmd_list(&api, category, limit, event).await?,
-        Cmd::Event { slug } => cmd_event(&api, slug).await?,
-        Cmd::Join { slug, team } => cmd_join(&api, slug, team).await?,
-        Cmd::Show { id } => { let id = resolve_name(&api, id, "challenge").await?; cmd_show(&api, id).await? }
-        Cmd::Get { id, dest } => { let id = resolve_name(&api, id, "challenge").await?; cmd_get(&api, id, dest).await? }
-        Cmd::Submit { id, flag } => { let id = resolve_name(&api, id, "challenge to submit to").await?; cmd_submit(&api, id, flag).await? }
-        Cmd::Hint { id } => { let id = resolve_name(&api, id, "challenge").await?; cmd_hint(&api, id).await? }
+        Cmd::Me => cmd_me(api).await?,
+        Cmd::Categories => cmd_categories(api).await?,
+        Cmd::List { category, limit, event } => cmd_list(api, category, limit, event).await?,
+        Cmd::Event { slug } => cmd_event(api, slug).await?,
+        Cmd::Join { slug, team } => cmd_join(api, slug, team).await?,
+        Cmd::Show { id } => { let id = resolve_name(api, id, "challenge").await?; cmd_show(api, id).await? }
+        Cmd::Get { id, dest } => { let id = resolve_name(api, id, "challenge").await?; cmd_get(api, id, dest).await? }
+        Cmd::Submit { id, flag } => { let id = resolve_name(api, id, "challenge to submit to").await?; cmd_submit(api, id, flag).await? }
+        Cmd::Hint { id } => { let id = resolve_name(api, id, "challenge").await?; cmd_hint(api, id).await? }
         Cmd::Leaderboard { event, limit, watch, interval } => {
-            cmd_leaderboard(&api, &event, limit, watch, interval).await?
+            cmd_leaderboard(api, &event, limit, watch, interval).await?
         }
-        Cmd::New { manifest, event } => cmd_new(&api, manifest, event).await?,
-        Cmd::Set { id, values } => cmd_set(&api, id, values).await?,
-        Cmd::FilesAdd { id, paths, manifest_dir: _ } => cmd_files_add(&api, id, paths).await?,
-        Cmd::FilesRemove { id, file_id } => cmd_files_remove(&api, id, file_id).await?,
-        Cmd::Publish { manifest, event } => cmd_publish(&api, manifest, event).await?,
-        Cmd::Verify { id, manifest } => { let rid = if id.trim().parse::<u64>().is_ok() { id.trim().parse().unwrap_or(0) } else { resolve_name(&api, Some(id), "challenge").await? }; cmd_verify(&api, rid, manifest).await? }
-        Cmd::Delete { id, confirm } => cmd_delete(&api, id, confirm).await?,
+        Cmd::New { manifest, event } => cmd_new(api, manifest, event).await?,
+        Cmd::Set { id, values } => cmd_set(api, id, values).await?,
+        Cmd::FilesAdd { id, paths, manifest_dir: _ } => cmd_files_add(api, id, paths).await?,
+        Cmd::FilesRemove { id, file_id } => cmd_files_remove(api, id, file_id).await?,
+        Cmd::Publish { manifest, event } => cmd_publish(api, manifest, event).await?,
+        Cmd::Verify { id, manifest } => { let rid = if id.trim().parse::<u64>().is_ok() { id.trim().parse().unwrap_or(0) } else { resolve_name(api, Some(id), "challenge").await? }; cmd_verify(api, rid, manifest).await? }
+        Cmd::Delete { id, confirm } => cmd_delete(api, id, confirm).await?,
     }
     Ok(())
 }
@@ -1103,5 +1160,75 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Some(cmd) => dispatch(cmd, &api).await,
         None => shell(&api).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn split_args_respects_quotes() {
+        assert_eq!(split_args("submit 38 'G24{abc}'"), ["submit", "38", "G24{abc}"]);
+        assert_eq!(split_args("show \"xor vault\""), ["show", "xor vault"]);
+        assert_eq!(split_args("  list   --limit 10 "), ["list", "--limit", "10"]);
+        assert_eq!(split_args(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_kv_accepts_and_rejects() {
+        assert_eq!(parse_kv("points=500").unwrap(), ("points".to_string(), "500".to_string()));
+        assert!(parse_kv("points").is_err());
+        assert!(parse_kv("=500").is_err());
+    }
+
+    fn good_manifest() -> Manifest {
+        Manifest {
+            title: "Cold Kitchen".into(),
+            category: "Boot to Root".into(),
+            difficulty: "hard".into(),
+            points: 500,
+            description: "A sufficiently long description here.".into(),
+            flags: vec!["G24{test}".into()],
+            hints: vec![],
+            files: vec![],
+            external: None,
+            event_id: None,
+        }
+    }
+
+    #[test]
+    fn manifest_validation_mirrors_server_guards() {
+        assert!(validate_manifest(&good_manifest()).is_ok());
+        let mut m = good_manifest();
+        m.title = "ab".into();
+        assert!(validate_manifest(&m).is_err());
+        let mut m = good_manifest();
+        m.description = "short".into();
+        assert!(validate_manifest(&m).is_err());
+        let mut m = good_manifest();
+        m.difficulty = "nightmare".into();
+        assert!(validate_manifest(&m).is_err());
+        let mut m = good_manifest();
+        m.points = 5;
+        assert!(validate_manifest(&m).is_err());
+        let mut m = good_manifest();
+        m.points = 1001;
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn live_points_prefers_decayed_value() {
+        assert_eq!(live_points(&json!({"points": 500, "value": 450})), 450);
+        assert_eq!(live_points(&json!({"points": 500})), 500);
+        assert_eq!(live_points(&json!({})), 0);
+    }
+
+    #[test]
+    fn u64_either_reads_both_casings() {
+        assert_eq!(u64_either(&json!({"initialPoints": 500}), "initialPoints", "initial_points"), Some(500));
+        assert_eq!(u64_either(&json!({"initial_points": 400}), "initialPoints", "initial_points"), Some(400));
+        assert_eq!(u64_either(&json!({}), "initialPoints", "initial_points"), None);
     }
 }

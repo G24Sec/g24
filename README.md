@@ -64,6 +64,8 @@ g24 show                          # no id? pick from a list
 g24 get 38 --dest ./ctf/38        # downloads with printed sha256
 g24 submit 38 'G24{...}'          # correct answers show +points
 g24 hint 38                       # may cost points, like the website
+g24 event cyberlab-the-campus-breach
+g24 join cyberlab-the-campus-breach --team "Maseno Knights"
 ```
 
 Challenges already solved are marked `*` in `list`. Wrong flags can
