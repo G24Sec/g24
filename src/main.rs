@@ -36,6 +36,8 @@ enum Cmd {
     List {
         #[arg(long)] category: Option<String>,
         #[arg(long, default_value_t = 20)] limit: usize,
+        /// Only challenges from this event slug
+        #[arg(long)] event: Option<String>,
     },
     /// Show one challenge (description, points, artifacts)
     Show { id: u64 },
@@ -92,6 +94,15 @@ enum Cmd {
     Delete {
         id: u64,
         #[arg(long)] confirm: bool,
+    },
+    /// Show an event (state, dates, your registration)
+    Event {
+        slug: String,
+    },
+    /// Register for an event
+    Join {
+        slug: String,
+        #[arg(long)] team: Option<String>,
     },
 }
 
@@ -260,8 +271,24 @@ async fn cmd_categories(api: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_list(api: &str, category: Option<String>, limit: usize) -> Result<()> {
-    let mut q = vec![("standalone", "true".to_string()), ("limit", limit.to_string())];
+async fn cmd_list(api: &str, category: Option<String>, limit: usize, event: Option<String>) -> Result<()> {
+    let mut q = vec![("limit", limit.to_string())];
+    if let Some(slug) = &event {
+        // resolve slug -> numeric id for the event filter
+        let (c0, base0, t0) = authed(api).await?;
+        let ev: serde_json::Value = auth(c0.get(format!("{base0}/api/ctf-events/{slug}")), &t0)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let eid = ev["event"]["id"]
+            .as_u64()
+            .or_else(|| ev["event"]["event_id"].as_u64())
+            .with_context(|| format!("event '{slug}' not found"))?;
+        q.push(("eventId", eid.to_string()));
+    } else {
+        q.push(("standalone", "true".to_string()));
+    }
     if let Some(cat) = category {
         q.push(("category", cat));
     }
@@ -284,6 +311,11 @@ async fn cmd_list(api: &str, category: Option<String>, limit: usize) -> Result<(
             ch["difficulty"].as_str().unwrap_or("?"),
             ch["title"].as_str().unwrap_or("?"),
         );
+        let fmt = ch["challengeFormat"].as_str().unwrap_or("flag");
+        let ctype = ch["challengeType"].as_str().unwrap_or("");
+        if fmt != "flag" || !ctype.is_empty() {
+            println!("      type:{ctype} format:{fmt}");
+        }
     }
     if v["hasMore"].as_bool().unwrap_or(false) {
         println!("…more available, raise --limit");
@@ -315,6 +347,19 @@ async fn cmd_show(api: &str, id: u64) -> Result<()> {
         ch["difficulty"].as_str().unwrap_or("?"),
         ch["points"].as_u64().unwrap_or(0),
     );
+    if let Some(dp) = ch.get("initialPoints").and_then(|v| v.as_u64()) {
+        println!(
+            "scoring: dynamic {} -> {} (decay limit {})",
+            dp,
+            ch["minPoints"].as_u64().unwrap_or(10),
+            ch["decayLimit"].as_u64().unwrap_or(50),
+        );
+    }
+    if let Some(reqs) = ch.get("unlockRequirements").and_then(|v| v.as_array()) {
+        if !reqs.is_empty() {
+            println!("unlocks after: {}", reqs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "));
+        }
+    }
     println!();
     println!("{}", ch["description"].as_str().unwrap_or(""));
     if let Some(files) = ch["files"].as_array() {
@@ -732,6 +777,51 @@ async fn cmd_delete(api: &str, id: u64, confirm: bool) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_event(api: &str, slug: String) -> Result<()> {
+    let (c, base, token) = authed(api).await?;
+    let v: serde_json::Value = auth(c.get(format!("{base}/api/ctf-events/{slug}")), &token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let e = &v["event"];
+    if e.is_null() {
+        bail!("{}", v["message"].as_str().unwrap_or("event not found"));
+    }
+    println!("{}  [{}]", e["title"].as_str().unwrap_or("?"), e["state"].as_str().unwrap_or("?"));
+    println!(
+        "{} — {}",
+        e["eventStart"].as_str().unwrap_or(e["event_start"].as_str().unwrap_or("?")),
+        e["eventEnd"].as_str().unwrap_or(e["event_end"].as_str().unwrap_or("?")),
+    );
+    if let Some(reg) = e.get("registration").filter(|r| !r.is_null()) {
+        println!("registered: {} ({})", reg["status"].as_str().unwrap_or("?"), reg["team"].as_str().unwrap_or("solo"));
+    }
+    Ok(())
+}
+
+async fn cmd_join(api: &str, slug: String, team: Option<String>) -> Result<()> {
+    let token = read_token()?;
+    let (c, base, _) = authed(api).await?;
+    let mut body = serde_json::json!({});
+    if let Some(t) = team {
+        body["team"] = serde_json::Value::String(t);
+    }
+    let v: serde_json::Value = c
+        .post(format!("{base}/api/ctf-registrations/{slug}"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await?
+        .json()
+        .await?;
+    if !v["success"].as_bool().unwrap_or(false) {
+        bail!("{}", v["message"].as_str().unwrap_or("registration failed"));
+    }
+    println!("{}", v["message"].as_str().unwrap_or("registered"));
+    Ok(())
+}
+
 async fn render_board(api: &str, event: &Option<String>, limit: usize) -> Result<()> {
     let path = match event {
         Some(slug) => format!("/api/ctf-leaderboard/{slug}"),
@@ -794,7 +884,9 @@ async fn dispatch(cmd: Cmd, api: &str) -> Result<()> {
         }
         Cmd::Me => cmd_me(&api).await?,
         Cmd::Categories => cmd_categories(&api).await?,
-        Cmd::List { category, limit } => cmd_list(&api, category, limit).await?,
+        Cmd::List { category, limit, event } => cmd_list(&api, category, limit, event).await?,
+        Cmd::Event { slug } => cmd_event(&api, slug).await?,
+        Cmd::Join { slug, team } => cmd_join(&api, slug, team).await?,
         Cmd::Show { id } => cmd_show(&api, id).await?,
         Cmd::Get { id, dest } => cmd_get(&api, id, dest).await?,
         Cmd::Submit { id, flag } => cmd_submit(&api, id, flag).await?,
@@ -831,7 +923,7 @@ async fn shell(api: &str) -> Result<()> {
             break;
         }
         if line == "help" {
-            println!("login logout me categories list show get submit hint leaderboard new set files-add files-remove publish verify delete");
+            println!("login logout me categories list show get submit hint leaderboard event join new set files-add files-remove publish verify delete");
             println!("examples: list --limit 10 | submit 38 'G24{{...}}' | leaderboard --watch");
             continue;
         }
