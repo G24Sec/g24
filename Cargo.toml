@@ -1,0 +1,17 @@
+[package]
+name = "g24"
+version = "0.1.0"
+edition = "2024"
+description = "G24SEC command-line: play, submit, leaderboard, and author challenges"
+license = "MIT"
+repository = "https://github.com/G24Sec/g24"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+sha2 = "0.10"
+hex = "0.4"
