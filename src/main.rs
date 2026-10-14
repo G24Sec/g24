@@ -10,6 +10,29 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
+mod out {
+    use owo_colors::OwoColorize;
+
+    pub fn ok(msg: &str) {
+        println!("{} {}", "✓".green().bold(), msg);
+    }
+    pub fn info(msg: &str) {
+        println!("{} {}", "»".cyan().bold(), msg);
+    }
+    pub fn warn(msg: &str) {
+        println!("{} {}", "!".yellow().bold(), msg);
+    }
+    pub fn err(msg: &str) {
+        eprintln!("{} {}", "✗".red().bold(), msg);
+    }
+    pub fn header(msg: &str) {
+        println!("\n{}", msg.cyan().bold());
+    }
+    // NOTE: mirrors toxi-cli output vocabulary on purpose. If toxi-cli ever
+    // exports its output module as a library, swap this mod for
+    // `use toxi_cli::output as out;` and delete it.
+}
+
 const DEFAULT_API: &str = "https://api-3.g24sec.com";
 
 #[derive(Parser)]
@@ -40,16 +63,16 @@ enum Cmd {
         #[arg(long)] event: Option<String>,
     },
     /// Show one challenge (description, points, artifacts)
-    Show { id: u64 },
+    Show { id: Option<String> },
     /// Download artifacts with printed sha256
     Get {
-        id: u64,
+        id: Option<String>,
         #[arg(long, default_value = ".")] dest: PathBuf,
     },
     /// Submit a flag
-    Submit { id: u64, flag: String },
+    Submit { id: Option<String>, flag: String },
     /// Next hint (may cost points)
-    Hint { id: u64 },
+    Hint { id: Option<String> },
     /// Leaderboard (global, or --event slug)
     Leaderboard {
         #[arg(long)] event: Option<String>,
@@ -87,7 +110,7 @@ enum Cmd {
     },
     /// Verify artifacts: health + sha256 vs local files
     Verify {
-        id: u64,
+        id: String,
         #[arg(long)] manifest: Option<PathBuf>,
     },
     /// Delete a challenge (organizer, needs --confirm)
@@ -247,7 +270,11 @@ async fn cmd_me(api: &str) -> Result<()> {
     println!(
         "@{}  rating {}  id {}",
         u["username"].as_str().unwrap_or("?"),
-        u["user_rating"].as_i64().unwrap_or(u["rating"].as_i64().unwrap_or(0)),
+u["userRating"]
+            .as_i64()
+            .or_else(|| u["user_rating"].as_i64())
+            .or_else(|| u["rating"].as_i64())
+            .unwrap_or(0),
         u["id"].as_str().unwrap_or("?"),
     );
     Ok(())
@@ -321,6 +348,116 @@ async fn cmd_list(api: &str, category: Option<String>, limit: usize, event: Opti
         println!("…more available, raise --limit");
     }
     Ok(())
+}
+
+async fn pick_challenge(api: &str, prompt: &str) -> Result<u64> {
+    let (c, base, token) = authed(api).await?;
+    let v: serde_json::Value = auth(
+        c.get(format!("{base}/api/ctf-challenges"))
+            .query(&[("standalone", "true"), ("limit", "50")]),
+        &token,
+    )
+    .send()
+    .await?
+    .json()
+    .await?;
+    let items = v["challenges"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        anyhow::bail!("no challenges found");
+    }
+    let labels: Vec<String> = items
+        .iter()
+        .map(|ch| {
+            format!(
+                "{} — {} ({}pts{})",
+                ch["id"].as_u64().unwrap_or(0),
+                ch["title"].as_str().unwrap_or("?"),
+                ch["points"].as_u64().unwrap_or(0),
+                if ch.get("isSolved").and_then(|s| s.as_bool()).unwrap_or(false) {
+                    ", solved"
+                } else {
+                    ""
+                },
+            )
+        })
+        .collect();
+    let sel = dialoguer::Select::new()
+        .with_prompt(prompt)
+        .items(&labels)
+        .default(0)
+        .interact()?;
+    Ok(items[sel]["id"].as_u64().unwrap_or(0))
+}
+
+async fn resolve_name(api: &str, id: Option<String>, prompt: &str) -> Result<u64> {
+    let raw = match id {
+        Some(v) => v,
+        None => return pick_challenge(api, prompt).await,
+    };
+    if let Ok(n) = raw.trim().parse::<u64>() {
+        return Ok(n);
+    }
+    let needle = raw.to_lowercase();
+    let (c, base, token) = authed(api).await?;
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let v: serde_json::Value = auth(
+            c.get(format!("{base}/api/ctf-challenges"))
+                .query(&[("standalone", "true"), ("limit", "200"), ("page", &page.to_string())]),
+            &token,
+        )
+        .send()
+        .await?
+        .json()
+        .await?;
+        let batch = v["challenges"].as_array().cloned().unwrap_or_default();
+        let total = v["total"].as_u64().unwrap_or(0) as usize;
+        items.extend(batch.iter().cloned());
+        if items.len() >= total || v["hasMore"].as_bool() != Some(true) || page >= 25 {
+            break;
+        }
+        page += 1;
+    }
+    let hits: Vec<&serde_json::Value> = items
+        .iter()
+        .filter(|ch| {
+            ch["title"]
+                .as_str()
+                .map(|t| t.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        })
+        .collect();
+    if let Some(exact) = hits.iter().find(|ch| {
+        ch["title"]
+            .as_str()
+            .map(|t| t.to_lowercase() == needle)
+            .unwrap_or(false)
+    }) {
+        return Ok(exact["id"].as_u64().unwrap_or(0));
+    }
+    match hits.len() {
+        0 => anyhow::bail!("no challenge matching '{raw}'"),
+        1 => Ok(hits[0]["id"].as_u64().unwrap_or(0)),
+        _ => {
+            let labels: Vec<String> = hits
+                .iter()
+                .map(|ch| {
+                    format!(
+                        "{} — {}",
+                        ch["id"].as_u64().unwrap_or(0),
+                        ch["title"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect();
+            let sel = dialoguer::Select::new()
+                .with_prompt("multiple matches")
+                .items(&labels)
+                .default(0)
+                .interact()?;
+            Ok(hits[sel]["id"].as_u64().unwrap_or(0))
+        }
+    }
 }
 
 async fn fetch_challenge(api: &str, id: u64) -> Result<serde_json::Value> {
@@ -411,14 +548,14 @@ async fn cmd_submit(api: &str, id: u64, flag: String) -> Result<()> {
         .json()
         .await?;
     if v["success"].as_bool().unwrap_or(false) {
-        println!("correct! +{} points", v["points"].as_u64().unwrap_or(0));
+        out::ok(&format!("correct! +{} points", v["points"].as_u64().unwrap_or(0)));
         if let Some(hp) = v["hintPenalty"].as_u64() {
             if hp > 0 {
-                println!("(hint penalty -{}, base {})", hp, v["basePoints"].as_u64().unwrap_or(0));
+                out::warn(&format!("hint penalty -{}, base {}", hp, v["basePoints"].as_u64().unwrap_or(0)));
             }
         }
     } else {
-        println!("incorrect: {}", v["message"].as_str().unwrap_or("wrong flag"));
+        out::err(&format!("incorrect: {}", v["message"].as_str().unwrap_or("wrong flag")));
         if let Some(r) = v.get("rating") {
             println!("rating {} → {}", r["oldRating"], r["newRating"]);
         }
@@ -837,17 +974,29 @@ async fn render_board(api: &str, event: &Option<String>, limit: usize) -> Result
     .await?
     .json()
     .await?;
+    use owo_colors::OwoColorize;
     let board = v["leaderboard"].as_array().cloned().unwrap_or_default();
     for (i, e) in board.iter().enumerate() {
-        println!(
+        let rank = e["rank"].as_u64().unwrap_or(i as u64 + 1);
+        let name = e["username"]
+            .as_str()
+            .or_else(|| e["name"].as_str())
+            .unwrap_or("?");
+        let line = format!(
             "{:>3}  {:<24} {:>6} pts  rating {}",
-            e["rank"].as_u64().unwrap_or(i as u64 + 1),
-            e["username"].as_str().unwrap_or("?"),
+            rank,
+            name,
             e["points"]
                 .as_u64()
                 .unwrap_or(e["score"].as_u64().unwrap_or(0)),
             e["rating"].as_i64().unwrap_or(e["elo"].as_i64().unwrap_or(0)),
         );
+        match rank {
+            1 => println!("{}", line.yellow().bold()),
+            2 => println!("{}", line.white().bold()),
+            3 => println!("{}", line.bright_yellow()),
+            _ => println!("{line}"),
+        }
     }
     Ok(())
 }
@@ -887,10 +1036,10 @@ async fn dispatch(cmd: Cmd, api: &str) -> Result<()> {
         Cmd::List { category, limit, event } => cmd_list(&api, category, limit, event).await?,
         Cmd::Event { slug } => cmd_event(&api, slug).await?,
         Cmd::Join { slug, team } => cmd_join(&api, slug, team).await?,
-        Cmd::Show { id } => cmd_show(&api, id).await?,
-        Cmd::Get { id, dest } => cmd_get(&api, id, dest).await?,
-        Cmd::Submit { id, flag } => cmd_submit(&api, id, flag).await?,
-        Cmd::Hint { id } => cmd_hint(&api, id).await?,
+        Cmd::Show { id } => { let id = resolve_name(&api, id, "challenge").await?; cmd_show(&api, id).await? }
+        Cmd::Get { id, dest } => { let id = resolve_name(&api, id, "challenge").await?; cmd_get(&api, id, dest).await? }
+        Cmd::Submit { id, flag } => { let id = resolve_name(&api, id, "challenge to submit to").await?; cmd_submit(&api, id, flag).await? }
+        Cmd::Hint { id } => { let id = resolve_name(&api, id, "challenge").await?; cmd_hint(&api, id).await? }
         Cmd::Leaderboard { event, limit, watch, interval } => {
             cmd_leaderboard(&api, &event, limit, watch, interval).await?
         }
@@ -899,7 +1048,7 @@ async fn dispatch(cmd: Cmd, api: &str) -> Result<()> {
         Cmd::FilesAdd { id, paths, manifest_dir: _ } => cmd_files_add(&api, id, paths).await?,
         Cmd::FilesRemove { id, file_id } => cmd_files_remove(&api, id, file_id).await?,
         Cmd::Publish { manifest, event } => cmd_publish(&api, manifest, event).await?,
-        Cmd::Verify { id, manifest } => cmd_verify(&api, id, manifest).await?,
+        Cmd::Verify { id, manifest } => { let rid = if id.trim().parse::<u64>().is_ok() { id.trim().parse().unwrap_or(0) } else { resolve_name(&api, Some(id), "challenge").await? }; cmd_verify(&api, rid, manifest).await? }
         Cmd::Delete { id, confirm } => cmd_delete(&api, id, confirm).await?,
     }
     Ok(())
