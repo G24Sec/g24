@@ -649,13 +649,11 @@ fn load_manifest(path: &PathBuf) -> Result<(Manifest, PathBuf)> {
 const DIFFICULTIES: &[&str] = &["beginner", "easy", "medium", "hard", "insane", "expert"];
 
 /// Fail fast with a local message instead of a server 400 roundtrip.
-/// Mirrors the creation guards in backend-next/lib/challenges.ts.
+/// Mirrors the creation guards in backend-next/lib/challenges.ts, where
+/// descriptions carry no minimum (file-only challenges need barely any).
 fn validate_manifest(m: &Manifest) -> Result<()> {
     if m.title.trim().len() < 3 {
         bail!("manifest: title must be at least 3 characters");
-    }
-    if m.description.trim().len() < 10 {
-        bail!("manifest: description must be at least 10 characters");
     }
     if m.category.trim().len() < 2 {
         bail!("manifest: category is required");
@@ -671,7 +669,7 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
 
 fn manifest_form(
     m: &Manifest,
-    dir: &PathBuf,
+    dir: &std::path::Path,
     event: Option<String>,
 ) -> Result<reqwest::multipart::Form> {
     let mut form = reqwest::multipart::Form::new()
@@ -1116,12 +1114,8 @@ async fn shell(api: &str) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new()?;
     let hist = config_dir().map(|d| d.join("history")).unwrap_or_else(|_| PathBuf::from(".g24-history"));
     let _ = rl.load_history(&hist);
-    loop {
-        let line = match rl.readline("g24> ") {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let line = line.trim();
+    while let Ok(input) = rl.readline("g24> ") {
+        let line = input.trim();
         if line.is_empty() {
             continue;
         }
@@ -1204,12 +1198,19 @@ mod tests {
         let mut m = good_manifest();
         m.title = "ab".into();
         assert!(validate_manifest(&m).is_err());
+        // Short and empty descriptions are legal (file-only challenges).
         let mut m = good_manifest();
-        m.description = "short".into();
-        assert!(validate_manifest(&m).is_err());
+        m.description = "go".into();
+        assert!(validate_manifest(&m).is_ok());
+        let mut m = good_manifest();
+        m.description = "".into();
+        assert!(validate_manifest(&m).is_ok());
         let mut m = good_manifest();
         m.difficulty = "nightmare".into();
         assert!(validate_manifest(&m).is_err());
+        let mut m = good_manifest();
+        m.difficulty = "expert".into();
+        assert!(validate_manifest(&m).is_ok());
         let mut m = good_manifest();
         m.points = 5;
         assert!(validate_manifest(&m).is_err());
