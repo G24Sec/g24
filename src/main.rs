@@ -502,6 +502,9 @@ async fn cmd_show(api: &str, id: u64) -> Result<()> {
         ch["difficulty"].as_str().unwrap_or("?"),
         live_points(&ch),
     );
+    if let Some(url) = ch.get("targetUrl").and_then(|v| v.as_str()) {
+        println!("target: {url}");
+    }
     if let Some(dp) = u64_either(&ch, "initialPoints", "initial_points") {
         println!(
             "scoring: dynamic {} -> {} (decay limit {})",
